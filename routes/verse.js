@@ -9,7 +9,7 @@ function normalizeBibleLanguage(raw) {
     .toLowerCase();
   if (/^[a-z]{3}$/.test(s)) return s;
   if (s === "en") return "eng";
-  // if (s === "yo") return "yor";
+  if (s === "yo") return "yor";
   return "eng";
 }
 
