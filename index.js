@@ -4,9 +4,12 @@ import axios from 'axios';
 import cors from 'cors';
 import express from 'express';
 
+import authRouter from './routes/auth.js';
 import breakdownRouter from './routes/breakdown.js';
 import notebookRouter from './routes/notebook.js';
 import verseRouter from './routes/verse.js';
+import { authenticateSession } from './middleware/auth.js';
+import { enforceGuestStudyLimit } from './middleware/guestLimit.js';
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3001;
@@ -18,6 +21,8 @@ function corsOptions() {
     return {
       origin: true,
       credentials: true,
+      exposedHeaders: ['X-Auth-Token'],
+      allowedHeaders: ['Content-Type', 'Authorization', 'X-Guest-Id'],
     };
   }
 
@@ -26,7 +31,12 @@ function corsOptions() {
     .map((s) => s.trim())
     .filter(Boolean);
   if (allowed.includes('*')) {
-    return { origin: true, credentials: true };
+    return {
+      origin: true,
+      credentials: true,
+      exposedHeaders: ['X-Auth-Token'],
+      allowedHeaders: ['Content-Type', 'Authorization', 'X-Guest-Id'],
+    };
   }
 
   return {
@@ -35,6 +45,8 @@ function corsOptions() {
       callback(null, allowed.includes(origin));
     },
     credentials: true,
+    exposedHeaders: ['X-Auth-Token'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Guest-Id'],
   };
 }
 
@@ -45,12 +57,19 @@ app.get('/api/health', (_req, res) => {
   res.json({ ok: true });
 });
 
-app.use('/api/verse', verseRouter);
-app.use('/api/breakdown', breakdownRouter);
-app.use('/api/notebook', notebookRouter);
+app.use('/api/auth', authRouter);
+app.use('/api/verse', authenticateSession, enforceGuestStudyLimit, verseRouter);
+app.use('/api/breakdown', authenticateSession, enforceGuestStudyLimit, breakdownRouter);
+app.use('/api/notebook', authenticateSession, notebookRouter);
 
-app.use((err, _req, res, _next) => {
-  console.error('[study-logos]', err);
+app.use((err, req, res, _next) => {
+  const status = err.statusCode ?? 500;
+  const isExpectedAuthFailure =
+    status === 401 || (status === 403 && err.code === "GUEST_LIMIT");
+
+  if (!isExpectedAuthFailure) {
+    console.error('[study-logos]', err);
+  }
 
   if (axios.isAxiosError(err) && err.response) {
     const data = err.response.data;
@@ -66,11 +85,11 @@ app.use((err, _req, res, _next) => {
     });
   }
 
-  const status = err.statusCode ?? 500;
   const message = err.message ?? 'Unexpected server error';
 
   res.status(status >= 400 && status < 600 ? status : 500).json({
     error: typeof message === 'string' ? message : 'Unexpected server error',
+    ...(err.code ? { code: err.code } : {}),
   });
 });
 

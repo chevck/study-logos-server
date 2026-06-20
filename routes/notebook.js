@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { requireSession } from '../middleware/auth.js';
 import { getNotebooksCollection } from '../lib/mongo.js';
 
 const router = Router();
@@ -40,7 +41,7 @@ router.get('/:notebookId', async (req, res, next) => {
   }
 });
 
-router.put('/:notebookId', async (req, res, next) => {
+router.put('/:notebookId', requireSession, async (req, res, next) => {
   try {
     const { notebookId } = req.params;
     if (!isValidNotebookId(notebookId)) {
