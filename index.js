@@ -4,9 +4,12 @@ import axios from 'axios';
 import cors from 'cors';
 import express from 'express';
 
+import { enforceExperienceReview } from './middleware/experienceReviewGate.js';
 import authRouter from './routes/auth.js';
 import breakdownRouter from './routes/breakdown.js';
+import feedbackRouter from './routes/feedback.js';
 import notebookRouter from './routes/notebook.js';
+import phrasesRouter from './routes/phrases.js';
 import verseRouter from './routes/verse.js';
 import { authenticateSession } from './middleware/auth.js';
 import { enforceGuestStudyLimit } from './middleware/guestLimit.js';
@@ -58,9 +61,11 @@ app.get('/api/health', (_req, res) => {
 });
 
 app.use('/api/auth', authRouter);
-app.use('/api/verse', authenticateSession, enforceGuestStudyLimit, verseRouter);
-app.use('/api/breakdown', authenticateSession, enforceGuestStudyLimit, breakdownRouter);
+app.use('/api/verse', authenticateSession, verseRouter);
+app.use('/api/phrases', authenticateSession, enforceGuestStudyLimit, phrasesRouter);
+app.use('/api/breakdown', authenticateSession, enforceExperienceReview, enforceGuestStudyLimit, breakdownRouter);
 app.use('/api/notebook', authenticateSession, notebookRouter);
+app.use('/api/feedback', authenticateSession, feedbackRouter);
 
 app.use((err, req, res, _next) => {
   const status = err.statusCode ?? 500;

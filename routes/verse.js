@@ -28,6 +28,7 @@ router.get("/", async (req, res, next) => {
       typeof translation === "string" && translation.trim()
         ? translation.trim()
         : defaultTrans;
+    console.log({ reference, trans, bibleLang });
     const result = await fetchVerseText(reference, trans, bibleLang);
     res.json(result);
   } catch (err) {

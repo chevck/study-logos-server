@@ -22,6 +22,7 @@ import {
   normalizeEmail,
   publicUser,
 } from "../lib/users.js";
+import { experienceReviewRequired, userObjectId } from "../lib/study.js";
 import { normalizeTheme } from "../lib/theme.js";
 
 const router = Router();
@@ -222,8 +223,22 @@ router.post("/reset-password", async (req, res, next) => {
   }
 });
 
-router.get("/me", requireSession, loadSessionUser, (req, res) => {
-  res.json({ user: req.user });
+router.get("/me", requireSession, loadSessionUser, async (req, res, next) => {
+  try {
+    const users = await getUsersCollection();
+    const user = await users.findOne({ _id: userObjectId(req.user.id) });
+    if (!user) {
+      return res.status(401).json({ error: "Session expired. Please sign in again." });
+    }
+
+    res.json({
+      user: req.user,
+      studyCount: user.studyCount ?? 0,
+      experienceReviewRequired: experienceReviewRequired(user),
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 router.patch("/me", requireSession, async (req, res, next) => {
