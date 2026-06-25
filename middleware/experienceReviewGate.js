@@ -20,6 +20,11 @@ export async function enforceExperienceReview(req, _res, next) {
     return next();
   }
 
+  const section = req.body?.section;
+  if (section && section !== 'core') {
+    return next();
+  }
+
   try {
     const users = await getUsersCollection();
     const user = await users.findOne({ _id: userObjectId(req.user.id) });

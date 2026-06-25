@@ -5,7 +5,20 @@ import {
   breakdownCacheKey,
   isBreakdownCacheDisabled,
 } from '../lib/breakdown-cache.js';
-import { normalizeFirstMentions } from '../lib/first-mention.js';
+import {
+  buildUserContent,
+  caseStudyCharacterNote,
+  extractSectionFromFull,
+  isBreakdownSection,
+  normalizeFullBreakdown,
+  normalizeSectionPayload,
+  normalizeStudyLanguage,
+  sanitizeReaderFirstName,
+  sectionCacheSuffix,
+  stripJsonFences,
+  STUDY_LANGUAGE_NOTE,
+  systemPromptForSection,
+} from '../lib/breakdown-sections.js';
 import {
   attachStudyMetaHeaders,
   incrementUserStudyCount,
@@ -13,7 +26,7 @@ import {
 
 const router = Router();
 
-const SYSTEM_PROMPT = `You are a biblical scholar and gifted communicator. When given a tapped word or group of words from a Bible verse (aligned to one original-language word via transliteration), produce a structured breakdown in JSON format only. No preamble, no markdown fences, just raw JSON.
+const FULL_SYSTEM_PROMPT = `You are a biblical scholar and gifted communicator. When given a tapped word or group of words from a Bible verse (aligned to one original-language word via transliteration), produce a structured breakdown in JSON format only. No preamble, no markdown fences, just raw JSON.
 
 Return exactly this structure:
 {
@@ -45,50 +58,40 @@ Return exactly this structure:
   "commentaryAttribution": "— Scholar Name, Book Title (Year)"
 }`;
 
-function stripJsonFences(text) {
-  let s = text.trim();
-  if (s.startsWith('```')) {
-    s = s.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
-  }
-  return s.trim();
-}
+async function callAnthropic({ model, system, userContent }) {
+  const message = await anthropic.messages.create({
+    model,
+    max_tokens: 4096,
+    system,
+    messages: [{ role: 'user', content: userContent }],
+  });
 
-function normalizeStudyLanguage(raw) {
-  const s = String(raw ?? 'eng').trim().toLowerCase();
-  if (s === 'yor' || s === 'yo') return 'yor';
-  return 'eng';
-}
+  const block = message.content?.find((b) => b.type === 'text');
+  const rawText = block?.type === 'text' ? block.text : '';
 
-const STUDY_LANGUAGE_NOTE = {
-  eng: '',
-  yor: `The reader's study language is Yorùbá (Yoruba). Write definition, caseStudy, commentary, caseStudyLabel, commentaryAttribution, and each firstMentions[].note in Yorùbá with natural tone marks where appropriate. Keep caseStudyStyle as exactly one of: story | cinematic | historical | parable (English, lowercase). Keep original Hebrew/Greek in "original", "relatedForm", and romanisation in "transliteration". The "phrase" field must match the tapped surface text from the verse (one word or grouped words). Use conventional reference formatting for crossReferences and firstMentions[].reference. Keep firstMentions[].language as "Greek" or "Hebrew".`,
-};
-
-function sanitizeReaderFirstName(raw) {
-  const trimmed = String(raw ?? '').trim().slice(0, 48);
-  if (!trimmed) return '';
-  const first = trimmed.split(/\s+/).filter(Boolean)[0] ?? '';
-  if (!first || !/^[\p{L}][\p{L}'-]*$/u.test(first)) return '';
-  return first;
-}
-
-function caseStudyCharacterNote(readerFirstName) {
-  const lines = [
-    'Case study character guidance:',
-    '- For "story" style: invent a distinct protagonist every time — vary first names, gender, ethnicity, and life situation.',
-    '- Never use "Marcus" or any stock name you have used before in this response.',
-    '- Include women and men as protagonists across different stories.',
-    '- Cinematic, historical, and parable styles should not rely on a recurring named character unless historically necessary.',
-  ];
-
-  if (readerFirstName) {
-    lines.push(
-      `- The signed-in reader's first name is "${readerFirstName}". When caseStudyStyle is "story", choose ONE of these approaches at random: (a) make ${readerFirstName} the protagonist in third person, (b) invent a completely different named character, or (c) use a different named character of another gender. Do not use ${readerFirstName} every time — variety matters.`,
-      `- If you feature ${readerFirstName}, keep the tone dignified and pastoral — not gimmicky.`,
-    );
+  if (!rawText) {
+    const err = new Error('The model returned an empty response');
+    err.statusCode = 500;
+    throw err;
   }
 
-  return lines.join('\n');
+  try {
+    return JSON.parse(stripJsonFences(rawText));
+  } catch (e) {
+    console.error('[breakdown] JSON parse failed:', e.message, rawText.slice(0, 500));
+    const err = new Error('Could not parse AI response as JSON. Try again.');
+    err.statusCode = 500;
+    throw err;
+  }
+}
+
+function attachStudyMetaIfNeeded(req, res, section) {
+  if (!req.user?.id) return Promise.resolve();
+  if (section && section !== 'core') return Promise.resolve();
+
+  return incrementUserStudyCount(req.user.id).then((meta) => {
+    attachStudyMetaHeaders(res, meta);
+  });
 }
 
 router.post('/', async (req, res, next) => {
@@ -103,10 +106,13 @@ router.post('/', async (req, res, next) => {
       phraseTransliteration,
       phraseOriginal,
       readerFirstName: readerFirstNameRaw,
+      section: sectionRaw,
+      coreContext,
     } = req.body ?? {};
 
     const surfacePhrase = phrase ?? word;
     const readerFirstName = sanitizeReaderFirstName(readerFirstNameRaw);
+    const section = isBreakdownSection(sectionRaw) ? sectionRaw : null;
 
     if (!surfacePhrase || !reference || !verseText) {
       return res.status(400).json({
@@ -128,7 +134,7 @@ router.post('/', async (req, res, next) => {
     const studyLang = normalizeStudyLanguage(studyLanguage);
 
     const cacheOff = isBreakdownCacheDisabled();
-    const cKey = breakdownCacheKey({
+    const baseKey = breakdownCacheKey({
       phrase: surfacePhrase,
       reference,
       verseText,
@@ -139,15 +145,62 @@ router.post('/', async (req, res, next) => {
     });
 
     if (!cacheOff) {
-      const cached = breakdownCache.get(cKey);
-      if (cached) {
-        res.setHeader('X-Breakdown-Cache', 'HIT');
-        if (req.user?.id) {
-          const meta = await incrementUserStudyCount(req.user.id);
-          attachStudyMetaHeaders(res, meta);
+      const fullCached = breakdownCache.get(baseKey);
+      if (fullCached) {
+        if (section) {
+          const extracted = extractSectionFromFull(fullCached, section);
+          if (extracted) {
+            res.setHeader('X-Breakdown-Cache', 'HIT');
+            await attachStudyMetaIfNeeded(req, res, section);
+            return res.json(extracted);
+          }
+        } else {
+          res.setHeader('X-Breakdown-Cache', 'HIT');
+          await attachStudyMetaIfNeeded(req, res, null);
+          return res.json(fullCached);
         }
-        return res.json(cached);
       }
+
+      if (section) {
+        const sectionKey = baseKey + sectionCacheSuffix(section);
+        const sectionCached = breakdownCache.get(sectionKey);
+        if (sectionCached) {
+          res.setHeader('X-Breakdown-Cache', 'HIT');
+          await attachStudyMetaIfNeeded(req, res, section);
+          return res.json(sectionCached);
+        }
+      }
+    }
+
+    if (section) {
+      const userContent = buildUserContent({
+        surfacePhrase,
+        reference,
+        verseText,
+        translation,
+        studyLang,
+        phraseTransliteration,
+        phraseOriginal,
+        readerFirstName,
+        section,
+        coreContext,
+      });
+
+      const parsed = await callAnthropic({
+        model,
+        system: systemPromptForSection(section),
+        userContent,
+      });
+
+      const normalized = normalizeSectionPayload(section, parsed);
+
+      if (!cacheOff) {
+        breakdownCache.set(baseKey + sectionCacheSuffix(section), normalized);
+      }
+
+      res.setHeader('X-Breakdown-Cache', cacheOff ? 'OFF' : 'MISS');
+      await attachStudyMetaIfNeeded(req, res, section);
+      return res.json(normalized);
     }
 
     const extra = STUDY_LANGUAGE_NOTE[studyLang] || STUDY_LANGUAGE_NOTE.eng;
@@ -170,66 +223,25 @@ router.post('/', async (req, res, next) => {
       .filter(Boolean)
       .join('\n');
 
-    const message = await anthropic.messages.create({
+    const parsed = await callAnthropic({
       model,
-      max_tokens: 4096,
-      system: SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: userContent }],
+      system: FULL_SYSTEM_PROMPT,
+      userContent,
     });
 
-    const block = message.content?.find((b) => b.type === 'text');
-    const rawText = block?.type === 'text' ? block.text : '';
-
-    if (!rawText) {
-      return res.status(500).json({
-        error: 'The model returned an empty response',
-      });
-    }
-
-    let parsed;
-    try {
-      parsed = JSON.parse(stripJsonFences(rawText));
-    } catch (e) {
-      console.error('[breakdown] JSON parse failed:', e.message, rawText.slice(0, 500));
-      return res.status(500).json({
-        error: 'Could not parse AI response as JSON. Try again.',
-      });
-    }
-
-    if (!parsed.phrase && parsed.word) {
-      parsed.phrase = parsed.word;
-    }
-
-    parsed.firstMentions = normalizeFirstMentions(parsed);
-    delete parsed.firstMention;
-    delete parsed.firstMentionReference;
-    delete parsed.firstMentionNote;
-
-    if (Array.isArray(parsed.crossReferences)) {
-      parsed.crossReferences = parsed.crossReferences
-        .map((entry) => {
-          if (typeof entry === 'string') return entry.trim();
-          if (entry && typeof entry === 'object' && typeof entry.reference === 'string') {
-            return entry.reference.trim();
-          }
-          return '';
-        })
-        .filter(Boolean);
-    } else {
-      parsed.crossReferences = [];
-    }
+    const normalized = normalizeFullBreakdown(parsed);
 
     if (!cacheOff) {
-      breakdownCache.set(cKey, parsed);
+      breakdownCache.set(baseKey, normalized);
     }
 
     res.setHeader('X-Breakdown-Cache', cacheOff ? 'OFF' : 'MISS');
-    if (req.user?.id) {
-      const meta = await incrementUserStudyCount(req.user.id);
-      attachStudyMetaHeaders(res, meta);
-    }
-    res.json(parsed);
+    await attachStudyMetaIfNeeded(req, res, null);
+    return res.json(normalized);
   } catch (err) {
+    if (err.statusCode) {
+      return res.status(err.statusCode).json({ error: err.message });
+    }
     next(err);
   }
 });

@@ -23,6 +23,11 @@ export async function enforceGuestStudyLimit(req, _res, next) {
     return next();
   }
 
+  const section = req.body?.section;
+  if (section && section !== "core") {
+    return next();
+  }
+
   const guestId = guestIdFromRequest(req);
   if (!guestId) {
     return next(limitError(GUEST_LIMIT_MESSAGE));
